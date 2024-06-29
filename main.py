@@ -1,163 +1,137 @@
-import streamlit as st
-from pdf2image import convert_from_path
+import fitz  
 import pytesseract
-import pandas as pd
+from PIL import Image
+import cv2
 import numpy as np
 import sqlite3
-import cv2
-from PIL import Image, ImageDraw
-
-Image.MAX_IMAGE_PIXELS = None  
-pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe' 
-conn = sqlite3.connect(':memory:')
-c = conn.cursor()
-c.execute('''
-    CREATE TABLE datapoints (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        unique_id TEXT,
-        filing_number TEXT,
-        filing_date TEXT,
-        rcs_number TEXT,
-        dp_value TEXT,
-        dp_unique_value TEXT
-    )
-''')
-def fix_rotation(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    coords = np.column_stack(np.where(gray > 0))
-    angle = cv2.minAreaRect(coords)[-1]
-    if angle < -45:
-        angle = -(90 + angle)
-    else:
-        angle = -angle
-    (h, w) = image.shape[:2]
-    center = (w // 2, h // 2)
-    M = cv2.getRotationMatrix2D(center, angle, 1.0)
-    rotated = cv2.warpAffine(image, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    return rotated
-def enhance_image(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    enhanced = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-def zoom_image(image, zoom_factor=1.5):
-    height, width = image.shape[:2]
-    new_width = int(width * zoom_factor)
-    new_height = int(height * zoom_factor)
-    zoomed = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-    return zoomed
-def extract_text_from_image(image):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    text = pytesseract.image_to_string(gray)
+import streamlit as st
+import os  
+def init_db():
+    conn = sqlite3.connect('extracted_data.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS extracted_data (
+            id INTEGER PRIMARY KEY,
+            filing_number TEXT,
+            filing_date TEXT,
+            rcs_number TEXT,
+            dp_key TEXT,
+            dp_value TEXT,
+            dp_unique_value TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+def extract_text_from_scanned_pdf(pdf_path):
+    """Extract text from a scanned PDF using OCR."""
+    pdf_document = fitz.open(pdf_path)
+    text = ""
+    for page_num in range(len(pdf_document)):
+        page = pdf_document.load_page(page_num)
+        pix = page.get_pixmap()
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        gray = cv2.cvtColor(np.array(img), cv2.COLOR_BGR2GRAY)
+        page_text = pytesseract.image_to_string(gray)
+        text += page_text + "\n"
+    
+    pdf_document.close()
     return text
-def resize_image(image, max_width=1000):
-    height, width = image.shape[:2]
-    if width > max_width:
-        ratio = max_width / width
-        new_dimensions = (max_width, int(height * ratio))
-        image = cv2.resize(image, new_dimensions, interpolation=cv2.INTER_AREA)
-    return image
 def detect_checkboxes(image):
+    """Detect checkboxes in an image using OpenCV."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 50, 150)
     
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     checkboxes = []
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        aspect_ratio = w / float(h)
-        if 0.8 < aspect_ratio < 1.2 and 10 < w < 40 and 10 < h < 40:
-            roi = image[y:y+h, x:x+w]
-            filled = cv2.countNonZero(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)) > (0.5 * w * h)
-            checkboxes.append((x, y, w, h, filled))
-    
+    for cnt in contours:
+        approx = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
+        if len(approx) == 4:  
+            (x, y, w, h) = cv2.boundingRect(cnt)
+            aspect_ratio = w / float(h)
+            if 0.8 <= aspect_ratio <= 1.2:  
+                checkboxes.append((x, y, w, h))
     return checkboxes
-def draw_checkboxes(image, checkboxes):
-    draw = ImageDraw.Draw(image)
-    for (x, y, w, h, filled) in checkboxes:
-        color = "green" if filled else "red"
-        draw.rectangle([x, y, x + w, y + h], outline=color, width=2)
-    return image
-def process_pdf(file):
-    images = convert_from_path(file)
-    extracted_data = []
+def extract_and_process_checkboxes(pdf_path):
+    """Extract and process checkboxes from a scanned PDF."""
+    pdf_document = fitz.open(pdf_path)
+    checkboxes_all_pages = []
+    for page_num in range(len(pdf_document)):
+        page = pdf_document.load_page(page_num)
+        pix = page.get_pixmap()
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        image_np = np.array(img)
 
-    for page_num, image in enumerate(images):
-        image = np.array(image)
-        image = fix_rotation(image)
-        image = enhance_image(image)
-        image = zoom_image(image)
-        image = resize_image(image)
+        checkboxes = detect_checkboxes(image_np)
+        checkboxes_all_pages.append(checkboxes)
+    
+    pdf_document.close()
+    return checkboxes_all_pages
+def extract_dps_from_text(text, anchors):
+    """Extract data points based on the text and given anchors."""
+    extracted_dps = {}
+    for anchor, dp_position in anchors.items():
+        anchor_index = text.find(anchor)
+        if anchor_index != -1:
+            dp_start = anchor_index + len(anchor) + dp_position['offset']
+            dp_end = dp_start + dp_position['length']
+            extracted_dps[anchor] = text[dp_start:dp_end].strip()
+    return extracted_dps
+anchors = {
+    "Invoice Number:": {"offset": 1, "length": 20},  
+    "Date:": {"offset": 1, "length": 10}
+}
+def save_extracted_data(filing_number, filing_date, rcs_number, dps):
+    conn = sqlite3.connect('extracted_data.db')
+    cursor = conn.cursor()
+    for dp_key, dp_value in dps.items():
+        cursor.execute('''
+            INSERT INTO extracted_data (filing_number, filing_date, rcs_number, dp_key, dp_value, dp_unique_value)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (filing_number, filing_date, rcs_number, dp_key, dp_value, f"{dp_key}_{dp_value[:10]}"))
+    conn.commit()
+    conn.close()
+def get_data_by_filing_number(filing_number):
+    conn = sqlite3.connect('extracted_data.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM extracted_data WHERE filing_number = ?', (filing_number,))
+    data = cursor.fetchall()
+    conn.close()
+    return data
 
-        text = extract_text_from_image(image)
-        checkboxes = detect_checkboxes(image)
-        image_with_boxes = draw_checkboxes(Image.fromarray(image), checkboxes)
-        filing_type, dp_sections = identify_filing_type_and_sections(text, checkboxes)
+init_db()
+st.title("PDF Data Extraction Engine")
+uploads_dir = "uploads"
+if not os.path.exists(uploads_dir):
+    os.makedirs(uploads_dir)
+uploaded_file = st.file_uploader("Upload a PDF file", type="pdf")
 
-        extracted_data.append({
-            "page": page_num + 1,
-            "text": text,
-            "checkboxes": checkboxes,
-            "image": image_with_boxes,
-            "filing_type": filing_type,
-            "dp_sections": dp_sections
-        })
+if uploaded_file:
+    pdf_path = os.path.join(uploads_dir, uploaded_file.name)
+    with open(pdf_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    st.write("Extracting text from the uploaded PDF...")
+    pdf_text = extract_text_from_scanned_pdf(pdf_path)
+    st.text_area("Extracted Text", pdf_text, height=200)
+    st.write("Detecting checkboxes in the PDF...")
+    checkboxes = extract_and_process_checkboxes(pdf_path)
+    st.write("Checkboxes detected (coordinates on each page):", checkboxes)
+    st.write("Extracting data points based on anchors...")
+    dps = extract_dps_from_text(pdf_text, anchors)
+    st.json(dps)
+    filing_number = st.text_input("Filing Number")
+    filing_date = st.text_input("Filing Date")
+    rcs_number = st.text_input("RCS Number")
 
-    return extracted_data
-def identify_filing_type_and_sections(text, checkboxes):
-    filing_type = "Unknown"
-    dp_sections = []
-
-    if any(checkbox[4] for checkbox in checkboxes): 
-        filing_type = "Specific Filing Type"
-        dp_sections = ["Section 1", "Section 2"] 
-
-    return filing_type, dp_sections
-def main():
-    st.title("PDF Data Extraction Engine Demo")
-
-    uploaded_file = st.file_uploader("Upload a PDF file", type=["pdf"])
-
-    if uploaded_file:
-        with st.spinner("Processing..."):
-            with open("temp.pdf", "wb") as f:
-                f.write(uploaded_file.read())
-            extracted_data = process_pdf("temp.pdf")
-            st.subheader("Extracted Data Points:")
-            for data in extracted_data:
-                st.write(f"**Page {data['page']}**")
-                st.text(data['text'])
-
-                st.subheader("Detected Checkboxes")
-                for x, y, w, h, filled in data['checkboxes']:
-                    st.write(f"Checkbox at ({x}, {y}), Size ({w}x{h}), Filled: {'Yes' if filled else 'No'}")
-
-                st.subheader("Filing Type and Sections")
-                st.write(f"Filing Type: {data['filing_type']}")
-                st.write(f"Detected Sections: {', '.join(data['dp_sections'])}")
-
-                st.image(data['image'], caption=f"Page {data['page']} with Checkboxes")
-
-                c.execute('''
-                    INSERT INTO datapoints (unique_id, filing_number, filing_date, rcs_number, dp_value, dp_unique_value)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (
-                    str(data['page']),
-                    "Filing Number Placeholder",  
-                    "Filing Date Placeholder",
-                    "RCS Number Placeholder",
-                    data['text'],
-                    "DP Unique Value Placeholder"
-                ))
-
-            conn.commit()
-            st.subheader("Review and Adjust Data Points")
-            datapoints = pd.read_sql_query("SELECT * FROM datapoints", conn)
-            edited_df = st.experimental_data_editor(datapoints, num_rows="dynamic")
-            if st.button("Save Adjustments"):
-                edited_df.to_sql('datapoints', conn, if_exists='replace', index=False)
-                st.success("Adjustments saved successfully.")
-            csv = datapoints.to_csv(index=False).encode('utf-8')
-            st.download_button("Download Extracted Data as CSV", data=csv, file_name="extracted_data.csv")
-
-if __name__ == "__main__":
-    main()
+    if st.button("Save Data"):
+        save_extracted_data(filing_number, filing_date, rcs_number, dps)
+        st.success("Data saved successfully!")
+st.header("Retrieve Extracted Data")
+filing_number_query = st.text_input("Enter Filing Number to Query")
+if st.button("Get Data"):
+    queried_data = get_data_by_filing_number(filing_number_query)
+    if queried_data:
+        st.write("Extracted Data for Filing Number:", filing_number_query)
+        st.write(queried_data)
+    else:
+        st.write("No data found for the given filing number.")
